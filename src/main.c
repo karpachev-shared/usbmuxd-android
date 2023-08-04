@@ -25,7 +25,7 @@
 #define _GNU_SOURCE
 
 #ifdef HAVE_CONFIG_H
-#include <config.h>
+#include <usbmuxd/config.h>
 #endif
 
 #include <stdio.h>
@@ -47,15 +47,30 @@
 #include <pwd.h>
 #include <grp.h>
 
-#include "log.h"
-#include "usb.h"
-#include "device.h"
-#include "client.h"
-#include "conf.h"
+#include <usbmuxd/log.h>
+#include <usbmuxd/usb.h>
+#include <usbmuxd/device.h>
+#include <usbmuxd/client.h>
+#include <usbmuxd/conf.h>
+#include <pthread.h>
 
-static const char *socket_path = "/var/run/usbmuxd";
-#define DEFAULT_LOCKFILE "/var/run/usbmuxd.pid"
-static const char *lockfile = DEFAULT_LOCKFILE;
+//static const char *socket_path = "/data/data/com.example.usbmuxd_testing/usbmuxd.sock";
+//#define DEFAULT_LOCKFILE "/data/data/com.example.usbmuxd_testing/usbmuxd.pid"
+//static const char *lockfile = DEFAULT_LOCKFILE;
+
+char app_dir[200];
+static char socket_path[200];
+static char lockfile[200];
+
+// задаем пути к сокету и lock-файлу
+void set_paths(const char *_app_dir) {
+    strcpy(app_dir, _app_dir);
+    strcpy(socket_path, _app_dir);
+    strcat(socket_path, "/usbmuxd.sock");
+
+    strcpy(lockfile, _app_dir);
+    strcat(lockfile, "/usbmuxd.lock");
+}
 
 // Global state used in other files
 int should_exit;
@@ -315,6 +330,9 @@ static int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout
 }
 #endif
 
+pthread_mutex_t exit_main_mutex;
+int exit_now = 0;
+
 static int main_loop(int listenfd)
 {
 	int to, cnt, i, dto;
@@ -357,6 +375,12 @@ static int main_loop(int listenfd)
 				}
 			}
 		} else if(cnt == 0) {
+            pthread_mutex_lock(&exit_main_mutex);
+            should_exit = exit_now;
+            pthread_mutex_unlock(&exit_main_mutex);
+            if (should_exit) {
+                break;
+            }
 			if(usb_process() < 0) {
 				usbmuxd_log(LL_FATAL, "usb_process() failed");
 				fdlist_free(&pollfds);
@@ -393,276 +417,29 @@ static int main_loop(int listenfd)
 	return 0;
 }
 
-/**
- * make this program run detached from the current console
- */
-static int daemonize(void)
+int main_start(int argc, char *argv[], int fd);
+
+void init_mutexes()
 {
-	pid_t pid;
-	pid_t sid;
-	int pfd[2];
-	int res;
-
-	// already a daemon
-	if (getppid() == 1)
-		return 0;
-
-	if((res = pipe(pfd)) < 0) {
-		usbmuxd_log(LL_FATAL, "pipe() failed.");
-		return res;
-	}
-
-	pid = fork();
-	if (pid < 0) {
-		usbmuxd_log(LL_FATAL, "fork() failed.");
-		return pid;
-	}
-
-	if (pid > 0) {
-		// exit parent process
-		int status;
-		close(pfd[1]);
-
-		if((res = read(pfd[0],&status,sizeof(int))) != sizeof(int)) {
-			fprintf(stderr, "usbmuxd: ERROR: Failed to get init status from child, check syslog for messages.\n");
-			exit(1);
-		}
-		if(status != 0)
-			fprintf(stderr, "usbmuxd: ERROR: Child process exited with error %d, check syslog for messages.\n", status);
-		exit(status);
-	}
-	// At this point we are executing as the child process
-	// but we need to do one more fork
-
-	daemon_pipe = pfd[1];
-	close(pfd[0]);
-	report_to_parent = 1;
-
-	// Create a new SID for the child process
-	sid = setsid();
-	if (sid < 0) {
-		usbmuxd_log(LL_FATAL, "setsid() failed.");
-		return -1;
-	}
-
-	pid = fork();
-	if (pid < 0) {
-		usbmuxd_log(LL_FATAL, "fork() failed (second).");
-		return pid;
-	}
-
-	if (pid > 0) {
-		// exit parent process
-		close(daemon_pipe);
-		exit(0);
-	}
-
-	// Change the current working directory.
-	if ((chdir("/")) < 0) {
-		usbmuxd_log(LL_FATAL, "chdir() failed");
-		return -2;
-	}
-	// Redirect standard files to /dev/null
-	if (!freopen("/dev/null", "r", stdin)) {
-		usbmuxd_log(LL_FATAL, "Redirection of stdin failed.");
-		return -3;
-	}
-	if (!freopen("/dev/null", "w", stdout)) {
-		usbmuxd_log(LL_FATAL, "Redirection of stdout failed.");
-		return -3;
-	}
-
-	return 0;
+    // иницилизируем один раз при запуске приложения
+    // уничтожать не будем, потому что непонятно где это делать, поэтому пусть живет весь процесс
+	pthread_mutex_init(&exit_main_mutex, NULL);
 }
 
-static int notify_parent(int status)
-{
-	int res;
-
-	report_to_parent = 0;
-	if ((res = write(daemon_pipe, &status, sizeof(int))) != sizeof(int)) {
-		usbmuxd_log(LL_FATAL, "Could not notify parent!");
-		if(res >= 0)
-			return -2;
-		else
-			return res;
-	}
-	close(daemon_pipe);
-	if (!freopen("/dev/null", "w", stderr)) {
-		usbmuxd_log(LL_FATAL, "Redirection of stderr failed.");
-		return -1;
-	}
-	return 0;
+// для остановки демона вызываем эту функцию только при отсоединении устройства
+void set_daemon_stop_flag(int stop_flag) {
+    pthread_mutex_lock(&exit_main_mutex);
+	exit_now = stop_flag;
+	pthread_mutex_unlock(&exit_main_mutex);
 }
 
-static void usage()
-{
-	printf("Usage: %s [OPTIONS]\n", PACKAGE_NAME);
-	printf("\n");
-	printf("Expose a socket to multiplex connections from and to iOS devices.\n");
-	printf("\n");
-	printf("OPTIONS:\n");
-	printf("  -h, --help\t\tPrint this message.\n");
-	printf("  -v, --verbose\t\tBe verbose (use twice or more to increase).\n");
-	printf("  -f, --foreground\tDo not daemonize (implies one -v).\n");
-	printf("  -U, --user USER\tChange to this user after startup (needs USB privileges).\n");
-	printf("  -n, --disable-hotplug\tDisables automatic discovery of devices on hotplug.\n");
-	printf("                       \tStarting another instance will trigger discovery instead.\n");
-	printf("  -z, --enable-exit\tEnable \"--exit\" request from other instances and exit\n");
-	printf("                   \tautomatically if no device is attached.\n");
-	printf("  -p, --no-preflight\tDisable lockdownd preflight on new device.\n");
-#ifdef HAVE_UDEV
-	printf("  -u, --udev\t\tRun in udev operation mode (implies -n and -z).\n");
-#endif
-#ifdef HAVE_SYSTEMD
-	printf("  -s, --systemd\t\tRun in systemd operation mode (implies -z and -f).\n");
-#endif
-	printf("  -S, --socket ADDR:PORT | PATH   Specify source ADDR and PORT or a UNIX\n");
-	printf("            \t\tsocket PATH to use for the listening socket.\n");
-	printf("            \t\tDefault: %s\n", socket_path);
-	printf("  -P, --pidfile PATH\tSpecify a different location for the pid file, or pass\n");
-	printf("            \t\tNONE to disable. Default: %s\n", DEFAULT_LOCKFILE);
-	printf("  -x, --exit\t\tNotify a running instance to exit if there are no devices\n");
-	printf("            \t\tconnected (sends SIGUSR1 to running instance) and exit.\n");
-	printf("  -X, --force-exit\tNotify a running instance to exit even if there are still\n");
-	printf("                  \tdevices connected (always works) and exit.\n");
-	printf("  -l, --logfile=LOGFILE\tLog (append) to LOGFILE instead of stderr or syslog.\n");
-	printf("  -V, --version\t\tPrint version information and exit.\n");
-	printf("\n");
-	printf("Homepage:    <" PACKAGE_URL ">\n");
-	printf("Bug Reports: <" PACKAGE_BUGREPORT ">\n");
+int mymain(int fd) {
+    set_daemon_stop_flag(0);
+    int result = main_start(1, NULL, fd);
+    return result;
 }
 
-static void parse_opts(int argc, char **argv)
-{
-	static struct option longopts[] = {
-		{"help", no_argument, NULL, 'h'},
-		{"foreground", no_argument, NULL, 'f'},
-		{"verbose", no_argument, NULL, 'v'},
-		{"user", required_argument, NULL, 'U'},
-		{"disable-hotplug", no_argument, NULL, 'n'},
-		{"enable-exit", no_argument, NULL, 'z'},
-		{"no-preflight", no_argument, NULL, 'p'},
-#ifdef HAVE_UDEV
-		{"udev", no_argument, NULL, 'u'},
-#endif
-#ifdef HAVE_SYSTEMD
-		{"systemd", no_argument, NULL, 's'},
-#endif
-		{"socket", required_argument, NULL, 'S'},
-		{"pidfile", required_argument, NULL, 'P'},
-		{"exit", no_argument, NULL, 'x'},
-		{"force-exit", no_argument, NULL, 'X'},
-		{"logfile", required_argument, NULL, 'l'},
-		{"version", no_argument, NULL, 'V'},
-		{NULL, 0, NULL, 0}
-	};
-	int c;
-
-#ifdef HAVE_SYSTEMD
-	const char* opts_spec = "hfvVuU:xXsnzl:pS:P:";
-#elif HAVE_UDEV
-	const char* opts_spec = "hfvVuU:xXnzl:pS:P:";
-#else
-	const char* opts_spec = "hfvVU:xXnzl:pS:P:";
-#endif
-
-	while (1) {
-		c = getopt_long(argc, argv, opts_spec, longopts, (int *) 0);
-		if (c == -1) {
-			break;
-		}
-
-		switch (c) {
-		case 'h':
-			usage();
-			exit(0);
-		case 'f':
-			foreground = 1;
-			break;
-		case 'v':
-			++verbose;
-			break;
-		case 'V':
-			printf("%s\n", PACKAGE_STRING);
-			exit(0);
-		case 'U':
-			drop_privileges = 1;
-			drop_user = optarg;
-			break;
-		case 'p':
-			no_preflight = 1;
-			break;
-#ifdef HAVE_UDEV
-		case 'u':
-			opt_disable_hotplug = 1;
-			opt_enable_exit = 1;
-			break;
-#endif
-#ifdef HAVE_SYSTEMD
-		case 's':
-			opt_enable_exit = 1;
-			foreground = 1;
-			break;
-#endif
-		case 'n':
-			opt_disable_hotplug = 1;
-			break;
-		case 'z':
-			opt_enable_exit = 1;
-			break;
-		case 'S':
-			if (!*optarg || *optarg == '-') {
-				usbmuxd_log(LL_FATAL, "ERROR: --socket requires an argument");
-				usage();
-				exit(2);
-			}
-			listen_addr = optarg;
-			break;
-		case 'P':
-			if (!*optarg || *optarg == '-') {
-				usbmuxd_log(LL_FATAL, "ERROR: --pidfile requires an argument");
-				usage();
-				exit(2);
-			}
-			if (!strcmp(optarg, "NONE")) {
-				lockfile = NULL;
-			} else {
-				lockfile = optarg;
-			}
-			break;
-		case 'x':
-			opt_exit = 1;
-			exit_signal = SIGUSR1;
-			break;
-		case 'X':
-			opt_exit = 1;
-			exit_signal = SIGTERM;
-			break;
-		case 'l':
-			if (!*optarg) {
-				usbmuxd_log(LL_FATAL, "ERROR: --logfile requires a non-empty filename");
-				usage();
-				exit(2);
-			}
-			if (use_logfile) {
-				usbmuxd_log(LL_FATAL, "ERROR: --logfile cannot be used multiple times");
-				exit(2);
-			}
-			if (!freopen(optarg, "a", stderr)) {
-				usbmuxd_log(LL_FATAL, "ERROR: fdreopen: %s", strerror(errno));
-			} else {
-				use_logfile = 1;
-			}
-			break;
-		default:
-			usage();
-			exit(2);
-		}
-	}
-}
-
-int main(int argc, char *argv[])
+int main_start(int argc, char *argv[], int fd)
 {
 	int listenfd;
 	int res = 0;
@@ -670,17 +447,10 @@ int main(int argc, char *argv[])
 	struct flock lock;
 	char pids[10];
 
-	parse_opts(argc, argv);
+    no_preflight = 1;
+    foreground = 1;
 
-	argc -= optind;
-	argv += optind;
-
-	if (!foreground && !use_logfile) {
-		verbose += LL_WARNING;
-		log_enable_syslog();
-	} else {
-		verbose += LL_NOTICE;
-	}
+    verbose += LL_NOTICE;
 
 	/* set log level to specified verbosity */
 	log_level = verbose;
@@ -695,7 +465,7 @@ int main(int argc, char *argv[])
 	if (lockfile) {
 		res = lfd = open(lockfile, O_WRONLY|O_CREAT, 0644);
 		if(res == -1) {
-			usbmuxd_log(LL_FATAL, "Could not open lockfile");
+			usbmuxd_log(LL_FATAL, "Could not open lockfile %s", lockfile);
 			goto terminate;
 		}
 		lock.l_type = F_WRLCK;
@@ -706,57 +476,9 @@ int main(int argc, char *argv[])
 		fcntl(lfd, F_GETLK, &lock);
 		close(lfd);
 	}
-	if (lockfile && lock.l_type != F_UNLCK) {
-		if (opt_exit) {
-			if (lock.l_pid && !kill(lock.l_pid, 0)) {
-				usbmuxd_log(LL_NOTICE, "Sending signal %d to instance with pid %d", exit_signal, lock.l_pid);
-				res = 0;
-				if (kill(lock.l_pid, exit_signal) < 0) {
-					usbmuxd_log(LL_FATAL, "Could not deliver signal %d to pid %d", exit_signal, lock.l_pid);
-					res = -1;
-				}
-				goto terminate;
-			} else {
-				usbmuxd_log(LL_ERROR, "Could not determine pid of the other running instance!");
-				res = -1;
-				goto terminate;
-			}
-		} else {
-			if (!opt_disable_hotplug) {
-				usbmuxd_log(LL_ERROR, "Another instance is already running (pid %d). exiting.", lock.l_pid);
-				res = -1;
-			} else {
-				usbmuxd_log(LL_NOTICE, "Another instance is already running (pid %d). Telling it to check for devices.", lock.l_pid);
-				if (lock.l_pid && !kill(lock.l_pid, 0)) {
-					usbmuxd_log(LL_NOTICE, "Sending signal SIGUSR2 to instance with pid %d", lock.l_pid);
-					res = 0;
-					if (kill(lock.l_pid, SIGUSR2) < 0) {
-						usbmuxd_log(LL_FATAL, "Could not deliver SIGUSR2 to pid %d", lock.l_pid);
-						res = -1;
-					}
-				} else {
-					usbmuxd_log(LL_ERROR, "Could not determine pid of the other running instance!");
-					res = -1;
-				}
-			}
-			goto terminate;
-		}
-	}
+
 	if (lockfile) {
 		unlink(lockfile);
-	}
-
-	if (opt_exit) {
-		usbmuxd_log(LL_NOTICE, "No running instance found, none killed. Exiting.");
-		goto terminate;
-	}
-
-	if (!foreground) {
-		if ((res = daemonize()) < 0) {
-			fprintf(stderr, "usbmuxd: FATAL: Could not daemonize!\n");
-			usbmuxd_log(LL_FATAL, "Could not daemonize!");
-			goto terminate;
-		}
 	}
 
 	if (lockfile) {
@@ -794,106 +516,17 @@ int main(int argc, char *argv[])
 	if(listenfd < 0)
 		goto terminate;
 
-#ifdef HAVE_LIBIMOBILEDEVICE
-	const char* userprefdir = config_get_config_dir();
-	struct stat fst;
-	memset(&fst, '\0', sizeof(struct stat));
-	if (stat(userprefdir, &fst) < 0) {
-		if (mkdir(userprefdir, 0775) < 0) {
-			usbmuxd_log(LL_FATAL, "Failed to create required directory '%s': %s", userprefdir, strerror(errno));
-			res = -1;
-			goto terminate;
-		}
-		if (stat(userprefdir, &fst) < 0) {
-			usbmuxd_log(LL_FATAL, "stat() failed after creating directory '%s': %s", userprefdir, strerror(errno));
-			res = -1;
-			goto terminate;
-		}
-	}
-
-	// make sure permission bits are set correctly
-	if (fst.st_mode != 02775) {
-		if (chmod(userprefdir, 02775) < 0) {
-			usbmuxd_log(LL_WARNING, "chmod(%s, 02775) failed: %s", userprefdir, strerror(errno));
-		}
-	}
-#endif
-
-	// drop elevated privileges
-	if (drop_privileges && (getuid() == 0 || geteuid() == 0)) {
-		struct passwd *pw;
-		if (!drop_user) {
-			usbmuxd_log(LL_FATAL, "No user to drop privileges to?");
-			res = -1;
-			goto terminate;
-		}
-		pw = getpwnam(drop_user);
-		if (!pw) {
-			usbmuxd_log(LL_FATAL, "Dropping privileges failed, check if user '%s' exists!", drop_user);
-			res = -1;
-			goto terminate;
-		}
-		if (pw->pw_uid == 0) {
-			usbmuxd_log(LL_INFO, "Not dropping privileges to root");
-		} else {
-#ifdef HAVE_LIBIMOBILEDEVICE
-			/* make sure the non-privileged user has proper access to the config directory */
-			if ((fst.st_uid != pw->pw_uid) || (fst.st_gid != pw->pw_gid)) {
-				if (chown(userprefdir, pw->pw_uid, pw->pw_gid) < 0) {
-					usbmuxd_log(LL_WARNING, "chown(%s, %d, %d) failed: %s", userprefdir, pw->pw_uid, pw->pw_gid, strerror(errno));
-				}
-			}
-#endif
-
-			if ((res = initgroups(drop_user, pw->pw_gid)) < 0) {
-				usbmuxd_log(LL_FATAL, "Failed to drop privileges (cannot set supplementary groups)");
-				goto terminate;
-			}
-			if ((res = setgid(pw->pw_gid)) < 0) {
-				usbmuxd_log(LL_FATAL, "Failed to drop privileges (cannot set group ID to %d)", pw->pw_gid);
-				goto terminate;
-			}
-			if ((res = setuid(pw->pw_uid)) < 0) {
-				usbmuxd_log(LL_FATAL, "Failed to drop privileges (cannot set user ID to %d)", pw->pw_uid);
-				goto terminate;
-			}
-
-			// security check
-			if (setuid(0) != -1) {
-				usbmuxd_log(LL_FATAL, "Failed to drop privileges properly!");
-				res = -1;
-				goto terminate;
-			}
-			if (getuid() != pw->pw_uid || getgid() != pw->pw_gid) {
-				usbmuxd_log(LL_FATAL, "Failed to drop privileges properly!");
-				res = -1;
-				goto terminate;
-			}
-			usbmuxd_log(LL_NOTICE, "Successfully dropped privileges to '%s'", drop_user);
-		}
-	}
-
 	client_init();
 	device_init();
 	usbmuxd_log(LL_INFO, "Initializing USB");
-	if((res = usb_init()) < 0)
+	if((res = usb_init(fd)) < 0)
 		goto terminate;
+
+
 
 	usbmuxd_log(LL_INFO, "%d device%s detected", res, (res==1)?"":"s");
 
 	usbmuxd_log(LL_NOTICE, "Initialization complete");
-
-	if (report_to_parent)
-		if((res = notify_parent(0)) < 0)
-			goto terminate;
-
-	if(opt_disable_hotplug) {
-		usbmuxd_log(LL_NOTICE, "Automatic device discovery on hotplug disabled.");
-		usb_autodiscover(0); // discovery to be triggered by new instance
-	}
-	if (opt_enable_exit) {
-		usbmuxd_log(LL_NOTICE, "Enabled exit on SIGUSR1 if no devices are attached. Start a new instance with \"--exit\" to trigger.");
-	}
 
 	res = main_loop(listenfd);
 	if(res < 0)
@@ -907,14 +540,11 @@ int main(int argc, char *argv[])
 	usbmuxd_log(LL_NOTICE, "Shutdown complete");
 
 terminate:
-	log_disable_syslog();
 
 	if (res < 0)
 		res = -res;
 	else
 		res = 0;
-	if (report_to_parent)
-		notify_parent(res);
 
 	return res;
 }

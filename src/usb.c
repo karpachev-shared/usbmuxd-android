@@ -1029,7 +1029,10 @@ int usb_init(void)
 
 	devlist_failures = 0;
 	device_polling = 1;
-	res = libusb_init(NULL);
+
+    const struct libusb_init_option options[] = {{.option = LIBUSB_OPTION_NO_DEVICE_DISCOVERY} };
+
+	res = libusb_init_context(NULL, options, (sizeof options)/(sizeof options[0]));
 
 	if (res != 0) {
 		usbmuxd_log(LL_FATAL, "libusb_init failed: %s", libusb_error_name(res));

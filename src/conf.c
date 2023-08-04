@@ -104,6 +104,8 @@ static char *config_utf16_to_utf8(wchar_t *unistr, long len, long *items_read, l
 }
 #endif
 
+extern const char *app_dir;
+
 const char *config_get_config_dir()
 {
 	char *base_config_dir = NULL;
@@ -129,7 +131,11 @@ const char *config_get_config_dir()
 #ifdef __APPLE__
 	base_config_dir = strdup("/var/db");
 #else
+#ifdef __ANDROID__
+    base_config_dir = strdup(app_dir);
+#else
 	base_config_dir = strdup("/var/lib");
+#endif
 #endif
 #endif
 	__config_dir = string_concat(base_config_dir, DIR_SEP_S, CONFIG_DIR, NULL);
